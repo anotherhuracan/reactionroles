@@ -7,13 +7,19 @@ country role via reaction-role panels.
 
 Features:
     - $rrsetup       : Create all missing country roles.
-    - $rr 1 / $rr 2   : Create/edit reaction-role panels for page 1 / 2.
-    - $rr refresh    : Delete and resend panels, preserving member roles.
-    - $rr sync       : Repair panels (missing reactions / stale embeds).
-    - $rr delete     : Delete only the panel messages (not roles).
+    - $rr 1 / $rr 2   : Create a NEW reaction-role panel for page 1 / 2.
+                        Panels can be created an unlimited number of times;
+                        each invocation posts a brand-new message and tracks
+                        it independently.
+    - $rr refresh    : Delete ALL existing panels (both pages) and send one
+                        fresh panel per page. Member country roles are kept.
+    - $rr sync       : Repair every tracked panel (missing reactions /
+                        outdated embed) without creating duplicates.
+    - $rr delete     : Delete ALL reaction-role panel messages across both
+                        pages and clear them from data.json.
 
 Persistence:
-    Message IDs and channel IDs for each panel are stored in data.json
+    Message IDs and channel IDs for every panel are stored in data.json
     so the bot can recover its state after a restart (e.g. on Railway).
 
 Author: Generated for production Railway deployment.
@@ -25,7 +31,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import discord
 from discord.ext import commands
@@ -54,22 +60,30 @@ class DataStore:
     Structure of data.json:
     {
         "panels": {
-            "1": {"channel_id": int, "message_id": int},
-            "2": {"channel_id": int, "message_id": int}
+            "1": [
+                {"channel_id": int, "message_id": int},
+                {"channel_id": int, "message_id": int}
+            ],
+            "2": [
+                {"channel_id": int, "message_id": int}
+            ]
         }
     }
+
+    Each page maps to a LIST of panels, allowing an unlimited number of
+    panel messages to be created and tracked for that page.
     """
 
     def __init__(self, path: str) -> None:
         self.path = path
         self._lock = asyncio.Lock()
-        self.data: Dict[str, Any] = {"panels": {}}
+        self.data: Dict[str, Any] = {"panels": {"1": [], "2": []}}
 
     def load(self) -> None:
         """Load data from disk, creating a default file if missing/corrupt."""
         if not os.path.exists(self.path):
             logger.info("No data file found at %s, creating a new one.", self.path)
-            self.data = {"panels": {}}
+            self.data = {"panels": {"1": [], "2": []}}
             self._save_sync()
             return
 
@@ -78,11 +92,26 @@ class DataStore:
                 loaded = json.load(f)
             if not isinstance(loaded, dict) or "panels" not in loaded:
                 raise ValueError("Malformed data.json structure")
+
+            panels = loaded.get("panels", {})
+            # Normalize legacy format (single dict per page) into list format.
+            for page_key, value in list(panels.items()):
+                if isinstance(value, dict):
+                    panels[page_key] = [value]
+                elif isinstance(value, list):
+                    panels[page_key] = value
+                else:
+                    panels[page_key] = []
+
+            panels.setdefault("1", [])
+            panels.setdefault("2", [])
+            loaded["panels"] = panels
+
             self.data = loaded
             logger.info("Loaded data.json successfully.")
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             logger.error("Failed to load data.json (%s). Starting fresh.", exc)
-            self.data = {"panels": {}}
+            self.data = {"panels": {"1": [], "2": []}}
             self._save_sync()
 
     def _save_sync(self) -> None:
@@ -102,27 +131,32 @@ class DataStore:
             except OSError as exc:
                 logger.error("Failed to write data.json: %s", exc)
 
-    def get_panel(self, page: int) -> Optional[Dict[str, int]]:
-        """Return stored panel info (channel_id, message_id) for a page."""
-        return self.data.get("panels", {}).get(str(page))
+    def get_panels(self, page: int) -> List[Dict[str, int]]:
+        """Return the list of stored panels for a page."""
+        return self.data.get("panels", {}).get(str(page), [])
 
-    async def set_panel(self, page: int, channel_id: int, message_id: int) -> None:
-        """Store panel info for a page and persist to disk."""
-        self.data.setdefault("panels", {})[str(page)] = {
-            "channel_id": channel_id,
-            "message_id": message_id,
-        }
+    async def add_panel(self, page: int, channel_id: int, message_id: int) -> None:
+        """Append a new panel entry for a page and persist to disk."""
+        self.data.setdefault("panels", {}).setdefault(str(page), []).append(
+            {"channel_id": channel_id, "message_id": message_id}
+        )
         await self.save()
 
-    async def remove_panel(self, page: int) -> None:
-        """Remove a stored panel entry and persist to disk."""
-        panels = self.data.setdefault("panels", {})
-        if str(page) in panels:
-            del panels[str(page)]
-            await self.save()
+    async def remove_panel(self, page: int, message_id: int) -> None:
+        """Remove a single panel entry (by message_id) and persist to disk."""
+        panels = self.data.setdefault("panels", {}).setdefault(str(page), [])
+        self.data["panels"][str(page)] = [
+            p for p in panels if p.get("message_id") != message_id
+        ]
+        await self.save()
 
-    def all_panels(self) -> Dict[str, Dict[str, int]]:
-        """Return all stored panels."""
+    async def clear_all_panels(self) -> None:
+        """Remove every tracked panel across all pages and persist to disk."""
+        self.data["panels"] = {"1": [], "2": []}
+        await self.save()
+
+    def all_panels(self) -> Dict[str, List[Dict[str, int]]]:
+        """Return all stored panels, keyed by page string."""
         return self.data.get("panels", {})
 
 
@@ -139,6 +173,24 @@ intents.message_content = True
 intents.reactions = True
 
 bot = commands.Bot(command_prefix=config.COMMAND_PREFIX, intents=intents, help_command=None)
+
+
+# --------------------------------------------------------------------------
+# Permission check
+# --------------------------------------------------------------------------
+
+def has_allowed_role():
+    """Command check factory: only allow members with one of the
+    configured ALLOWED_ROLE_IDS to invoke the command.
+    """
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+            return False
+        member_role_ids = {role.id for role in ctx.author.roles}
+        return bool(member_role_ids.intersection(config.ALLOWED_ROLE_IDS))
+
+    return commands.check(predicate)
 
 
 # --------------------------------------------------------------------------
@@ -202,16 +254,6 @@ async def get_or_create_role(
     return None
 
 
-def get_country_roles(guild: discord.Guild) -> Dict[str, discord.Role]:
-    """Return a mapping of country name -> Role object for roles that exist."""
-    result: Dict[str, discord.Role] = {}
-    for country_name in countries.ALL_COUNTRIES:
-        role = discord.utils.get(guild.roles, name=country_name)
-        if role is not None:
-            result[country_name] = role
-    return result
-
-
 async def remove_all_other_country_roles(
     member: discord.Member, keep_role_id: int
 ) -> None:
@@ -271,29 +313,19 @@ async def remove_other_country_reactions(
 # Panel management helpers
 # --------------------------------------------------------------------------
 
-async def fetch_panel_message(
-    page: int,
+async def fetch_message_safe(
+    channel_id: int, message_id: int
 ) -> Optional[discord.Message]:
-    """Attempt to fetch the stored panel message for a page.
+    """Attempt to fetch a message by channel/message ID.
 
-    Returns None if no panel is stored, or if the channel/message
-    can no longer be found (deleted channel/message, etc).
+    Returns None if the channel or message can no longer be found.
     """
-    panel_info = store.get_panel(page)
-    if panel_info is None:
-        return None
-
-    channel_id = panel_info.get("channel_id")
-    message_id = panel_info.get("message_id")
-    if channel_id is None or message_id is None:
-        return None
-
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
             channel = await bot.fetch_channel(channel_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            logger.warning("Stored channel %s for page %s not found.", channel_id, page)
+            logger.warning("Channel %s not found.", channel_id)
             return None
 
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -303,7 +335,7 @@ async def fetch_panel_message(
         message = await channel.fetch_message(message_id)
         return message
     except discord.NotFound:
-        logger.warning("Stored message %s for page %s not found (deleted).", message_id, page)
+        logger.warning("Message %s not found (deleted).", message_id)
         return None
     except discord.Forbidden:
         logger.error("Missing permissions to fetch message %s in channel %s.", message_id, channel_id)
@@ -327,41 +359,14 @@ async def add_all_reactions(message: discord.Message, page: int) -> None:
         await asyncio.sleep(0.3)
 
 
-async def create_or_update_panel(
-    ctx: commands.Context, page: int
-) -> str:
-    """Create a new panel or edit the existing one for the given page.
+async def create_new_panel(ctx: commands.Context, page: int) -> str:
+    """Always create and send a brand-new panel for the given page.
 
-    Returns a human-readable status string.
+    Panels can be created an unlimited number of times; each call is
+    tracked independently in data.json.
     """
     embed = build_panel_embed(page)
 
-    existing_message = await fetch_panel_message(page)
-
-    if existing_message is not None:
-        # Panel exists and is reachable -> edit it in place.
-        try:
-            await existing_message.edit(embed=embed)
-        except discord.Forbidden:
-            return f"❌ Missing permissions to edit the panel for page {page}."
-        except discord.HTTPException as exc:
-            logger.error("HTTP error editing panel message: %s", exc)
-            return f"❌ Failed to edit the panel for page {page} due to an API error."
-
-        # Ensure all reactions are present (covers manually-cleared reactions).
-        existing_emojis = {str(r.emoji) for r in existing_message.reactions}
-        page_countries = countries.get_page(page)
-        for emoji in page_countries.values():
-            if emoji not in existing_emojis:
-                try:
-                    await existing_message.add_reaction(emoji)
-                    await asyncio.sleep(0.3)
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    logger.error("Error adding missing reaction %s: %s", emoji, exc)
-
-        return f"✏️ Edited existing panel for page {page}."
-
-    # No existing/reachable panel -> send a new one.
     try:
         new_message = await ctx.send(embed=embed)
     except discord.Forbidden:
@@ -370,9 +375,9 @@ async def create_or_update_panel(
         logger.error("HTTP error sending panel message: %s", exc)
         return f"❌ Failed to send panel for page {page} due to an API error."
 
-    await store.set_panel(page, new_message.channel.id, new_message.id)
+    await store.add_panel(page, new_message.channel.id, new_message.id)
     await add_all_reactions(new_message, page)
-    return f"✅ Created new panel for page {page}."
+    return f"✅ Created new panel for page {page} (message ID: {new_message.id})."
 
 
 # --------------------------------------------------------------------------
@@ -386,20 +391,28 @@ async def on_ready() -> None:
     store.load()
 
     # Validate stored panels still exist; log warnings for any that don't.
-    for page_str in list(store.all_panels().keys()):
-        page = int(page_str)
-        message = await fetch_panel_message(page)
-        if message is None:
-            logger.warning(
-                "Panel for page %s could not be located on startup "
-                "(channel/message may have been deleted). It will be "
-                "recreated on next '$rr %s' or '$rr refresh'.",
-                page,
-                page,
+    total_checked = 0
+    total_missing = 0
+    for page_str, panel_list in store.all_panels().items():
+        for panel_info in panel_list:
+            total_checked += 1
+            message = await fetch_message_safe(
+                panel_info.get("channel_id"), panel_info.get("message_id")
             )
-        else:
-            logger.info("Verified panel for page %s is reachable.", page)
+            if message is None:
+                total_missing += 1
+                logger.warning(
+                    "Panel message %s for page %s could not be located "
+                    "on startup (may have been deleted manually).",
+                    panel_info.get("message_id"),
+                    page_str,
+                )
 
+    logger.info(
+        "Startup panel check complete: %s tracked, %s unreachable.",
+        total_checked,
+        total_missing,
+    )
     logger.info("Bot is ready.")
 
 
@@ -409,11 +422,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
     if isinstance(error, commands.CommandNotFound):
         return  # Silently ignore unknown commands.
 
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ You don't have permission to use this command.")
-        return
-
-    if isinstance(error, commands.CheckFailure):
+    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
         await ctx.send("❌ You don't have permission to use this command.")
         return
 
@@ -442,11 +451,12 @@ async def on_error(event_method: str, *args: Any, **kwargs: Any) -> None:
 # Reaction event handlers
 # --------------------------------------------------------------------------
 
-def _is_tracked_panel_message(message_id: int) -> Optional[int]:
+def _find_tracked_page(message_id: int) -> Optional[int]:
     """Return the page number if the given message ID is a tracked panel."""
-    for page_str, info in store.all_panels().items():
-        if info.get("message_id") == message_id:
-            return int(page_str)
+    for page_str, panel_list in store.all_panels().items():
+        for panel_info in panel_list:
+            if panel_info.get("message_id") == message_id:
+                return int(page_str)
     return None
 
 
@@ -456,7 +466,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if payload.user_id == (bot.user.id if bot.user else None):
         return  # Ignore the bot's own reactions.
 
-    page = _is_tracked_panel_message(payload.message_id)
+    page = _find_tracked_page(payload.message_id)
     if page is None:
         return  # Not a tracked panel.
 
@@ -507,19 +517,15 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     await remove_all_other_country_roles(member, keep_role_id=role.id)
 
     # Keep reactions in sync: remove the user's reactions on any OTHER
-    # country flags (across both panel pages) so only the current
-    # selection remains highlighted for them.
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(payload.channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            channel = None
-
-    if channel is not None and isinstance(channel, (discord.TextChannel, discord.Thread)):
-        for page_str in store.all_panels().keys():
-            other_page = int(page_str)
-            panel_message = await fetch_panel_message(other_page)
+    # country flags across every tracked panel (all pages, all copies)
+    # so only the current selection remains highlighted for them.
+    for page_str, panel_list in store.all_panels().items():
+        for panel_info in panel_list:
+            if panel_info.get("message_id") == payload.message_id:
+                continue  # Skip the panel they just reacted on.
+            panel_message = await fetch_message_safe(
+                panel_info.get("channel_id"), panel_info.get("message_id")
+            )
             if panel_message is None:
                 continue
             try:
@@ -527,11 +533,17 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
             except discord.HTTPException as exc:
                 logger.error("Error syncing reactions across panels: %s", exc)
 
+    # Also clean up any other reaction on the SAME panel the member reacted
+    # on (in case they had multiple reactions on this one message somehow).
+    same_message = await fetch_message_safe(payload.channel_id, payload.message_id)
+    if same_message is not None:
+        await remove_other_country_reactions(same_message, member, keep_emoji=emoji_str)
+
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
     """Handle a reaction being removed from a tracked panel message."""
-    page = _is_tracked_panel_message(payload.message_id)
+    page = _find_tracked_page(payload.message_id)
     if page is None:
         return
 
@@ -577,7 +589,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
 # --------------------------------------------------------------------------
 
 @bot.command(name="rrsetup")
-@commands.has_permissions(manage_roles=True)
+@has_allowed_role()
 @commands.guild_only()
 async def rrsetup(ctx: commands.Context) -> None:
     """Create every missing country role in the guild."""
@@ -606,26 +618,26 @@ async def rrsetup(ctx: commands.Context) -> None:
 
 
 @bot.group(name="rr", invoke_without_command=True)
-@commands.has_permissions(manage_roles=True)
+@has_allowed_role()
 @commands.guild_only()
 async def rr(ctx: commands.Context, page: Optional[str] = None) -> None:
     """Main reaction-role command group.
 
     Usage:
-        $rr 1        - create/edit panel for page 1
-        $rr 2        - create/edit panel for page 2
-        $rr refresh  - delete and resend all panels
-        $rr sync     - repair existing panels
-        $rr delete   - delete panel messages only
+        $rr 1        - create a NEW panel for page 1 (unlimited uses)
+        $rr 2        - create a NEW panel for page 2 (unlimited uses)
+        $rr refresh  - delete ALL panels and resend one fresh panel per page
+        $rr sync     - repair every existing panel
+        $rr delete   - delete ALL panel messages (every page, every copy)
     """
     if page is None:
         await ctx.send(
             "Usage:\n"
-            "`$rr 1` - create/update page 1 panel\n"
-            "`$rr 2` - create/update page 2 panel\n"
-            "`$rr refresh` - delete & resend all panels\n"
-            "`$rr sync` - repair existing panels\n"
-            "`$rr delete` - delete panel messages only"
+            "`$rr 1` - create a new page 1 panel (can be used repeatedly)\n"
+            "`$rr 2` - create a new page 2 panel (can be used repeatedly)\n"
+            "`$rr refresh` - delete ALL panels & resend one fresh panel per page\n"
+            "`$rr sync` - repair all existing panels\n"
+            "`$rr delete` - delete ALL panel messages"
         )
         return
 
@@ -634,7 +646,7 @@ async def rr(ctx: commands.Context, page: Optional[str] = None) -> None:
     if page in ("1", "2"):
         page_number = int(page)
         async with ctx.typing():
-            status = await create_or_update_panel(ctx, page_number)
+            status = await create_new_panel(ctx, page_number)
         await ctx.send(status)
         return
 
@@ -656,115 +668,137 @@ async def rr(ctx: commands.Context, page: Optional[str] = None) -> None:
 
 
 async def rr_refresh(ctx: commands.Context) -> None:
-    """Delete existing panels and resend fresh ones.
+    """Delete ALL existing panels (every page, every copy) and resend one
+    fresh panel per page.
 
     Member country roles are untouched; only the panel messages and
     their reactions are recreated.
     """
     async with ctx.typing():
-        # Step 1: delete existing panel messages (if reachable).
-        for page_str in list(store.all_panels().keys()):
-            page_number = int(page_str)
-            message = await fetch_panel_message(page_number)
-            if message is not None:
-                try:
-                    await message.delete()
-                except discord.Forbidden:
-                    logger.error("Missing permissions to delete panel message for page %s.", page_number)
-                except discord.NotFound:
-                    pass
-                except discord.HTTPException as exc:
-                    logger.error("HTTP error deleting panel message: %s", exc)
-            await store.remove_panel(page_number)
+        deleted_count = await _delete_all_panels()
 
-        # Step 2: send fresh panels for both pages.
+        # Send one fresh panel per page.
         results = []
         for page_number in (1, 2):
-            status = await create_or_update_panel(ctx, page_number)
+            status = await create_new_panel(ctx, page_number)
             results.append(status)
 
-    await ctx.send("🔄 Refresh complete.\n" + "\n".join(results))
+    await ctx.send(
+        f"🔄 Refresh complete. Deleted {deleted_count} old panel(s).\n"
+        + "\n".join(results)
+    )
 
 
 async def rr_sync(ctx: commands.Context) -> None:
-    """Repair existing panels: fix missing reactions and stale embeds."""
+    """Repair every existing tracked panel across both pages:
+    fix missing reactions and stale embeds. Never creates duplicates.
+    """
     async with ctx.typing():
         results = []
+        any_panels = False
+
         for page_number in (1, 2):
-            panel_info = store.get_panel(page_number)
-            if panel_info is None:
-                results.append(f"⚠️ No panel stored for page {page_number}. Use `$rr {page_number}` to create one.")
+            panel_list = store.get_panels(page_number)
+            if not panel_list:
+                results.append(f"⚠️ No panels stored for page {page_number}.")
                 continue
 
-            message = await fetch_panel_message(page_number)
-            if message is None:
-                results.append(
-                    f"⚠️ Panel for page {page_number} could not be found "
-                    f"(deleted?). Use `$rr {page_number}` to recreate it."
-                )
-                continue
-
-            # Check and fix the embed if it differs from the expected one.
             expected_embed = build_panel_embed(page_number)
-            needs_edit = True
-            if message.embeds:
-                current_embed = message.embeds[0]
-                if (
-                    current_embed.title == expected_embed.title
-                    and current_embed.description == expected_embed.description
-                ):
-                    needs_edit = False
-
-            if needs_edit:
-                try:
-                    await message.edit(embed=expected_embed)
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    logger.error("Error editing panel during sync: %s", exc)
-
-            # Check and fix missing reactions.
-            existing_emojis = {str(r.emoji) for r in message.reactions}
             page_countries = countries.get_page(page_number)
-            added = 0
-            for emoji in page_countries.values():
-                if emoji not in existing_emojis:
-                    try:
-                        await message.add_reaction(emoji)
-                        added += 1
-                        await asyncio.sleep(0.3)
-                    except (discord.Forbidden, discord.HTTPException) as exc:
-                        logger.error("Error adding reaction during sync: %s", exc)
 
-            results.append(
-                f"✅ Page {page_number} synced. "
-                f"Embed {'updated' if needs_edit else 'already current'}, "
-                f"{added} reaction(s) restored."
-            )
+            for panel_info in panel_list:
+                any_panels = True
+                message = await fetch_message_safe(
+                    panel_info.get("channel_id"), panel_info.get("message_id")
+                )
+                if message is None:
+                    results.append(
+                        f"⚠️ Panel {panel_info.get('message_id')} (page {page_number}) "
+                        f"could not be found (deleted?). Skipped."
+                    )
+                    continue
+
+                # Check and fix the embed if it differs from the expected one.
+                needs_edit = True
+                if message.embeds:
+                    current_embed = message.embeds[0]
+                    if (
+                        current_embed.title == expected_embed.title
+                        and current_embed.description == expected_embed.description
+                    ):
+                        needs_edit = False
+
+                if needs_edit:
+                    try:
+                        await message.edit(embed=expected_embed)
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        logger.error("Error editing panel during sync: %s", exc)
+
+                # Check and fix missing reactions.
+                existing_emojis = {str(r.emoji) for r in message.reactions}
+                added = 0
+                for emoji in page_countries.values():
+                    if emoji not in existing_emojis:
+                        try:
+                            await message.add_reaction(emoji)
+                            added += 1
+                            await asyncio.sleep(0.3)
+                        except (discord.Forbidden, discord.HTTPException) as exc:
+                            logger.error("Error adding reaction during sync: %s", exc)
+
+                results.append(
+                    f"✅ Panel {message.id} (page {page_number}) synced. "
+                    f"Embed {'updated' if needs_edit else 'current'}, "
+                    f"{added} reaction(s) restored."
+                )
+
+        if not any_panels:
+            results.append("No panels exist yet. Use `$rr 1` / `$rr 2` to create some.")
 
     await ctx.send("\n".join(results))
 
 
-async def rr_delete(ctx: commands.Context) -> None:
-    """Delete only the reaction-role panel messages, preserving roles."""
-    async with ctx.typing():
-        deleted = 0
-        for page_str in list(store.all_panels().keys()):
-            page_number = int(page_str)
-            message = await fetch_panel_message(page_number)
+async def _delete_all_panels() -> int:
+    """Delete every tracked panel message across all pages and clear
+    data.json. Returns the number of messages successfully deleted.
+    """
+    deleted = 0
+    for page_str, panel_list in list(store.all_panels().items()):
+        page_number = int(page_str)
+        for panel_info in list(panel_list):
+            message = await fetch_message_safe(
+                panel_info.get("channel_id"), panel_info.get("message_id")
+            )
             if message is not None:
                 try:
                     await message.delete()
                     deleted += 1
                 except discord.Forbidden:
-                    logger.error("Missing permissions to delete panel message for page %s.", page_number)
+                    logger.error(
+                        "Missing permissions to delete panel message %s (page %s).",
+                        panel_info.get("message_id"),
+                        page_number,
+                    )
                 except discord.NotFound:
                     pass
                 except discord.HTTPException as exc:
                     logger.error("HTTP error deleting panel message: %s", exc)
-            await store.remove_panel(page_number)
+
+    await store.clear_all_panels()
+    return deleted
+
+
+async def rr_delete(ctx: commands.Context) -> None:
+    """Delete ALL reaction-role panel messages (every page, every copy)
+    and clear them from data.json. Country roles and member role
+    assignments are never affected.
+    """
+    async with ctx.typing():
+        deleted = await _delete_all_panels()
 
     await ctx.send(
-        f"🗑️ Deleted {deleted} panel message(s) and cleared them from data.json. "
-        f"Country roles and member assignments were not affected."
+        f"🗑️ Deleted {deleted} panel message(s) across all pages and cleared "
+        f"data.json. Country roles and member assignments were not affected."
     )
 
 
