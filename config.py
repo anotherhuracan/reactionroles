@@ -6,6 +6,7 @@ and defines global constants used across the bot.
 """
 
 import os
+from typing import List
 
 # --- Bot Configuration ---
 
@@ -32,3 +33,14 @@ EMBED_DESCRIPTION: str = (
     "React below to choose your country.\n"
     "You may only have **ONE** country role.\n\n"
 )
+
+# --- Permission Configuration ---
+
+# Only members holding at least one of these role IDs may use the
+# management commands ($rrsetup, $rr 1/2/refresh/sync/delete).
+ALLOWED_ROLE_IDS: List[int] = [
+    1522583335740637294,
+    1502474199179071598,
+    1502826874022269008,
+    1502720083544510624,
+]
