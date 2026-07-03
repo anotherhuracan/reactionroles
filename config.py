@@ -1,40 +1,34 @@
-# config.py
+"""
+Configuration module for the Country Roles Discord bot.
+
+Loads sensitive/environment-specific values from environment variables
+and defines global constants used across the bot.
+"""
 
 import os
 
-# ==============================
-# Discord
-# ==============================
+# --- Bot Configuration ---
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+# Discord bot token, read from environment variable (set this on Railway).
+DISCORD_TOKEN: str = os.environ.get("DISCORD_TOKEN", "")
 
-if not TOKEN:
-    raise RuntimeError(
-        "No DISCORD_TOKEN environment variable found.\n"
-        "Set it in Railway Variables before starting the bot."
-    )
+# Command prefix for the bot.
+COMMAND_PREFIX: str = "$"
 
-PREFIX = "$"
+# Path to the JSON file used for persistence.
+DATA_FILE: str = "data.json"
 
-# ==============================
-# Bot Settings
-# ==============================
+# Embed color (Discord blurple-ish / can be customized).
+EMBED_COLOR: int = 0x3498DB
 
-EMBED_COLOR = 0x5865F2  # Discord blurple
+# Embed footer text.
+EMBED_FOOTER: str = "Removing your reaction removes your role."
 
-EMBED_TITLE = "🌍 Country Roles"
+# Embed title.
+EMBED_TITLE: str = "🌍 Country Roles"
 
-EMBED_DESCRIPTION = (
-    "React with the flag below to receive your country role.\n\n"
-    "• You can only have **one** country role at a time.\n"
-    "• Removing your reaction removes your role."
+# Embed description.
+EMBED_DESCRIPTION: str = (
+    "React below to choose your country.\n"
+    "You may only have **ONE** country role.\n\n"
 )
-
-# File used to save reaction-role messages
-DATA_FILE = "data.json"
-
-# Whether to automatically create missing roles
-AUTO_CREATE_ROLES = True
-
-# Log basic events to the console
-LOG_EVENTS = True
