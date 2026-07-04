@@ -6,17 +6,20 @@ A production-ready Discord bot that lets members self-assign a single
 country role via reaction-role panels.
 
 Features:
-    - $rrsetup       : Create all missing country roles.
-    - $rr 1 / $rr 2   : Create a NEW reaction-role panel for page 1 / 2.
-                        Panels can be created an unlimited number of times;
-                        each invocation posts a brand-new message and tracks
-                        it independently.
-    - $rr refresh    : Delete ALL existing panels (both pages) and send one
-                        fresh panel per page. Member country roles are kept.
-    - $rr sync       : Repair every tracked panel (missing reactions /
-                        outdated embed) without creating duplicates.
-    - $rr delete     : Delete ALL reaction-role panel messages across both
-                        pages and clear them from data.json.
+    - $rrsetup        : Create all missing country roles.
+    - $rr 1 / 2 / 3    : Create a NEW reaction-role panel for that page.
+                         Panels can be created an unlimited number of times;
+                         each invocation posts a brand-new message and tracks
+                         it independently.
+    - $rr refresh     : Delete ALL existing panels (every page) and send one
+                         fresh panel per page. Member country roles are kept.
+    - $rr sync        : Repair every tracked panel (missing reactions /
+                         outdated embed) without creating duplicates.
+    - $rr delete      : Delete ALL reaction-role panel messages across every
+                         page and clear them from data.json.
+    - $rrstats        : Show how many members hold each country role.
+    - $rrcount        : Show how many panels currently exist per page.
+    - $help           : Show a full command reference embed.
 
 Persistence:
     Message IDs and channel IDs for every panel are stored in data.json
@@ -64,9 +67,8 @@ class DataStore:
                 {"channel_id": int, "message_id": int},
                 {"channel_id": int, "message_id": int}
             ],
-            "2": [
-                {"channel_id": int, "message_id": int}
-            ]
+            "2": [...],
+            "3": [...]
         }
     }
 
@@ -77,13 +79,18 @@ class DataStore:
     def __init__(self, path: str) -> None:
         self.path = path
         self._lock = asyncio.Lock()
-        self.data: Dict[str, Any] = {"panels": {"1": [], "2": []}}
+        self.data: Dict[str, Any] = self._default_data()
+
+    @staticmethod
+    def _default_data() -> Dict[str, Any]:
+        """Build a default data structure with an empty list per page."""
+        return {"panels": {str(p): [] for p in countries.PAGES.keys()}}
 
     def load(self) -> None:
         """Load data from disk, creating a default file if missing/corrupt."""
         if not os.path.exists(self.path):
             logger.info("No data file found at %s, creating a new one.", self.path)
-            self.data = {"panels": {"1": [], "2": []}}
+            self.data = self._default_data()
             self._save_sync()
             return
 
@@ -103,15 +110,16 @@ class DataStore:
                 else:
                     panels[page_key] = []
 
-            panels.setdefault("1", [])
-            panels.setdefault("2", [])
-            loaded["panels"] = panels
+            # Ensure every known page has at least an empty list entry.
+            for page_number in countries.PAGES.keys():
+                panels.setdefault(str(page_number), [])
 
+            loaded["panels"] = panels
             self.data = loaded
             logger.info("Loaded data.json successfully.")
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             logger.error("Failed to load data.json (%s). Starting fresh.", exc)
-            self.data = {"panels": {"1": [], "2": []}}
+            self.data = self._default_data()
             self._save_sync()
 
     def _save_sync(self) -> None:
@@ -152,7 +160,7 @@ class DataStore:
 
     async def clear_all_panels(self) -> None:
         """Remove every tracked panel across all pages and persist to disk."""
-        self.data["panels"] = {"1": [], "2": []}
+        self.data["panels"] = {str(p): [] for p in countries.PAGES.keys()}
         await self.save()
 
     def all_panels(self) -> Dict[str, List[Dict[str, int]]]:
@@ -194,7 +202,7 @@ def has_allowed_role():
 
 
 # --------------------------------------------------------------------------
-# Embed builder
+# Embed builders
 # --------------------------------------------------------------------------
 
 def build_panel_embed(page: int) -> discord.Embed:
@@ -218,6 +226,76 @@ def build_panel_embed(page: int) -> discord.Embed:
         color=config.EMBED_COLOR,
     )
     embed.set_footer(text=config.EMBED_FOOTER)
+    return embed
+
+
+def build_help_embed() -> discord.Embed:
+    """Build the embed shown by the $help command."""
+    embed = discord.Embed(
+        title="📖 Country Roles — Command Reference",
+        description=(
+            f"Prefix: `{config.COMMAND_PREFIX}`\n"
+            "Commands below require one of the configured management roles, "
+            "except where noted."
+        ),
+        color=config.EMBED_COLOR,
+    )
+
+    embed.add_field(
+        name="🛠️ Setup",
+        value=(
+            f"`{config.COMMAND_PREFIX}rrsetup`\n"
+            "Creates every missing country role in the server. "
+            "Skips roles that already exist."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📋 Panels",
+        value=(
+            f"`{config.COMMAND_PREFIX}rr 1` / `{config.COMMAND_PREFIX}rr 2` / `{config.COMMAND_PREFIX}rr 3`\n"
+            "Posts a brand-new reaction-role panel for that page. "
+            "Can be run as many times as you like — every panel stays fully functional.\n\n"
+            f"`{config.COMMAND_PREFIX}rr refresh`\n"
+            "Deletes **every** existing panel (all pages) and posts exactly "
+            "one fresh panel per page. Member roles are kept.\n\n"
+            f"`{config.COMMAND_PREFIX}rr sync`\n"
+            "Repairs every tracked panel: restores missing reactions and "
+            "updates outdated embeds. Never creates duplicates.\n\n"
+            f"`{config.COMMAND_PREFIX}rr delete`\n"
+            "Deletes **every** panel message across all pages and clears "
+            "them from storage. Roles are never touched."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📊 Info",
+        value=(
+            f"`{config.COMMAND_PREFIX}rrstats`\n"
+            "Shows how many members currently hold each country role.\n\n"
+            f"`{config.COMMAND_PREFIX}rrcount`\n"
+            "Shows how many panels currently exist for each page."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🌍 How members pick a country",
+        value=(
+            "React with a flag emoji on any panel to receive that role. "
+            "Only one country role is allowed at a time — reacting with a "
+            "new flag automatically removes the old role and reaction. "
+            "Removing your reaction removes the role."
+        ),
+        inline=False,
+    )
+
+    total_countries = len(countries.ALL_COUNTRIES)
+    embed.set_footer(
+        text=f"{total_countries} countries tracked across {len(countries.PAGES)} pages."
+    )
     return embed
 
 
@@ -427,7 +505,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         return
 
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"❌ Missing argument: `{error.param.name}`. See `$rr` usage.")
+        await ctx.send(f"❌ Missing argument: `{error.param.name}`. See `$help`.")
         return
 
     if isinstance(error, commands.BadArgument):
@@ -522,7 +600,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     for page_str, panel_list in store.all_panels().items():
         for panel_info in panel_list:
             if panel_info.get("message_id") == payload.message_id:
-                continue  # Skip the panel they just reacted on.
+                continue  # Skip the panel they just reacted on (handled below).
             panel_message = await fetch_message_safe(
                 panel_info.get("channel_id"), panel_info.get("message_id")
             )
@@ -588,6 +666,17 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> Non
 # Commands
 # --------------------------------------------------------------------------
 
+@bot.command(name="help")
+async def help_command(ctx: commands.Context) -> None:
+    """Show the full command reference. Available to everyone."""
+    try:
+        await ctx.send(embed=build_help_embed())
+    except discord.Forbidden:
+        logger.error("Missing permissions to send the help embed in channel %s.", ctx.channel.id)
+    except discord.HTTPException as exc:
+        logger.error("HTTP error sending help embed: %s", exc)
+
+
 @bot.command(name="rrsetup")
 @has_allowed_role()
 @commands.guild_only()
@@ -624,26 +713,28 @@ async def rr(ctx: commands.Context, page: Optional[str] = None) -> None:
     """Main reaction-role command group.
 
     Usage:
-        $rr 1        - create a NEW panel for page 1 (unlimited uses)
-        $rr 2        - create a NEW panel for page 2 (unlimited uses)
+        $rr 1/2/3    - create a NEW panel for that page (unlimited uses)
         $rr refresh  - delete ALL panels and resend one fresh panel per page
         $rr sync     - repair every existing panel
         $rr delete   - delete ALL panel messages (every page, every copy)
     """
+    valid_pages = {str(p) for p in countries.PAGES.keys()}
+
     if page is None:
+        page_list = "/".join(sorted(valid_pages))
         await ctx.send(
-            "Usage:\n"
-            "`$rr 1` - create a new page 1 panel (can be used repeatedly)\n"
-            "`$rr 2` - create a new page 2 panel (can be used repeatedly)\n"
-            "`$rr refresh` - delete ALL panels & resend one fresh panel per page\n"
-            "`$rr sync` - repair all existing panels\n"
-            "`$rr delete` - delete ALL panel messages"
+            f"Usage:\n"
+            f"`$rr {page_list}` - create a new panel for that page (repeatable)\n"
+            f"`$rr refresh` - delete ALL panels & resend one fresh panel per page\n"
+            f"`$rr sync` - repair all existing panels\n"
+            f"`$rr delete` - delete ALL panel messages\n\n"
+            f"See `$help` for full details."
         )
         return
 
     page = page.lower().strip()
 
-    if page in ("1", "2"):
+    if page in valid_pages:
         page_number = int(page)
         async with ctx.typing():
             status = await create_new_panel(ctx, page_number)
@@ -662,8 +753,9 @@ async def rr(ctx: commands.Context, page: Optional[str] = None) -> None:
         await rr_delete(ctx)
         return
 
+    page_list = ", ".join(sorted(valid_pages))
     await ctx.send(
-        "❌ Unknown option. Use `1`, `2`, `refresh`, `sync`, or `delete`."
+        f"❌ Unknown option. Use `{page_list}`, `refresh`, `sync`, or `delete`."
     )
 
 
@@ -679,7 +771,7 @@ async def rr_refresh(ctx: commands.Context) -> None:
 
         # Send one fresh panel per page.
         results = []
-        for page_number in (1, 2):
+        for page_number in countries.PAGES.keys():
             status = await create_new_panel(ctx, page_number)
             results.append(status)
 
@@ -690,14 +782,14 @@ async def rr_refresh(ctx: commands.Context) -> None:
 
 
 async def rr_sync(ctx: commands.Context) -> None:
-    """Repair every existing tracked panel across both pages:
+    """Repair every existing tracked panel across all pages:
     fix missing reactions and stale embeds. Never creates duplicates.
     """
     async with ctx.typing():
         results = []
         any_panels = False
 
-        for page_number in (1, 2):
+        for page_number in countries.PAGES.keys():
             panel_list = store.get_panels(page_number)
             if not panel_list:
                 results.append(f"⚠️ No panels stored for page {page_number}.")
@@ -753,7 +845,8 @@ async def rr_sync(ctx: commands.Context) -> None:
                 )
 
         if not any_panels:
-            results.append("No panels exist yet. Use `$rr 1` / `$rr 2` to create some.")
+            page_list = "/".join(str(p) for p in countries.PAGES.keys())
+            results.append(f"No panels exist yet. Use `$rr {page_list}` to create some.")
 
     await ctx.send("\n".join(results))
 
@@ -800,6 +893,74 @@ async def rr_delete(ctx: commands.Context) -> None:
         f"🗑️ Deleted {deleted} panel message(s) across all pages and cleared "
         f"data.json. Country roles and member assignments were not affected."
     )
+
+
+@bot.command(name="rrcount")
+@has_allowed_role()
+@commands.guild_only()
+async def rrcount(ctx: commands.Context) -> None:
+    """Show how many panels currently exist for each page."""
+    lines = []
+    total = 0
+    for page_number in countries.PAGES.keys():
+        count = len(store.get_panels(page_number))
+        total += count
+        lines.append(f"Page {page_number}: **{count}** panel(s)")
+
+    embed = discord.Embed(
+        title="📋 Active Panel Count",
+        description="\n".join(lines) if lines else "No panels tracked.",
+        color=config.EMBED_COLOR,
+    )
+    embed.set_footer(text=f"Total: {total} panel message(s) across all pages.")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="rrstats")
+@has_allowed_role()
+@commands.guild_only()
+async def rrstats(ctx: commands.Context) -> None:
+    """Show how many members currently hold each country role."""
+    guild = ctx.guild
+    if guild is None:
+        return
+
+    async with ctx.typing():
+        counts = []
+        for country_name in countries.ALL_COUNTRIES:
+            role = discord.utils.get(guild.roles, name=country_name)
+            member_count = len(role.members) if role is not None else 0
+            emoji = countries.emoji_from_country(country_name) or ""
+            counts.append((country_name, emoji, member_count))
+
+        # Sort by member count, descending; keep only countries with 1+ members
+        # near the top, but still show the rest for completeness.
+        counts.sort(key=lambda item: item[2], reverse=True)
+
+        lines = [
+            f"{emoji}  **{name}** — {count}"
+            for name, emoji, count in counts
+            if count > 0
+        ]
+
+        if not lines:
+            description = "No members currently hold any country role."
+        else:
+            description = "\n".join(lines)
+
+        # Discord embed description limit is 4096 characters; truncate safely.
+        if len(description) > 4000:
+            description = description[:4000] + "\n… (truncated)"
+
+        embed = discord.Embed(
+            title="📊 Country Role Distribution",
+            description=description,
+            color=config.EMBED_COLOR,
+        )
+        total_assigned = sum(c for _, _, c in counts)
+        embed.set_footer(text=f"Total members with a country role: {total_assigned}")
+
+    await ctx.send(embed=embed)
 
 
 # --------------------------------------------------------------------------
