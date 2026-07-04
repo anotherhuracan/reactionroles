@@ -37,7 +37,8 @@ EMBED_DESCRIPTION: str = (
 # --- Permission Configuration ---
 
 # Only members holding at least one of these role IDs may use the
-# management commands ($rrsetup, $rr 1/2/refresh/sync/delete).
+# management commands ($rrsetup, $rr 1/2/3/refresh/sync/delete, $rrstats,
+# $rrcount).
 ALLOWED_ROLE_IDS: List[int] = [
     1522583335740637294,
     1502474199179071598,
