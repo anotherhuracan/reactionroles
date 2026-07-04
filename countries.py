@@ -1,13 +1,13 @@
 """
 Country and flag emoji definitions for the Country Roles bot.
 
-Countries are split into two pages, each containing roughly 20 entries.
+Countries are split into three pages of roughly 20-25 entries each.
 Each entry maps a country name to its corresponding Unicode flag emoji.
 """
 
 from typing import Dict, List
 
-# Page 1: Americas + Europe (part 1)
+# Page 1: Americas + Western/Northern Europe
 PAGE_1: Dict[str, str] = {
     "United States": "🇺🇸",
     "Canada": "🇨🇦",
@@ -31,7 +31,7 @@ PAGE_1: Dict[str, str] = {
     "Poland": "🇵🇱",
 }
 
-# Page 2: Europe (part 2) + Asia + Oceania + Africa + Middle East
+# Page 2: Eastern Europe + Asia + Oceania + Africa + Middle East
 PAGE_2: Dict[str, str] = {
     "Czech Republic": "🇨🇿",
     "Portugal": "🇵🇹",
@@ -60,10 +60,40 @@ PAGE_2: Dict[str, str] = {
     "United Arab Emirates": "🇦🇪",
 }
 
+# Page 3: Balkans + Baltics + Caucasus + Middle East + additions
+PAGE_3: Dict[str, str] = {
+    "Serbia": "🇷🇸",
+    "Israel": "🇮🇱",
+    "Belarus": "🇧🇾",
+    "Croatia": "🇭🇷",
+    "Greece": "🇬🇷",
+    "Romania": "🇷🇴",
+    "Bulgaria": "🇧🇬",
+    "Hungary": "🇭🇺",
+    "Slovakia": "🇸🇰",
+    "Slovenia": "🇸🇮",
+    "Iceland": "🇮🇸",
+    "Latvia": "🇱🇻",
+    "Lithuania": "🇱🇹",
+    "Estonia": "🇪🇪",
+    "Georgia": "🇬🇪",
+    "Armenia": "🇦🇲",
+    "Azerbaijan": "🇦🇿",
+    "Iraq": "🇮🇶",
+    "Iran": "🇮🇷",
+    "Jordan": "🇯🇴",
+    "Lebanon": "🇱🇧",
+    "Kenya": "🇰🇪",
+    "Morocco": "🇲🇦",
+    "Colombia": "🇨🇴",
+    "Chile": "🇨🇱",
+}
+
 # All pages combined, indexed by page number (1-based) for easy lookup.
 PAGES: Dict[int, Dict[str, str]] = {
     1: PAGE_1,
     2: PAGE_2,
+    3: PAGE_3,
 }
 
 # Flattened mapping of emoji -> country name, built once at import time.
